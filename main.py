@@ -1,14 +1,14 @@
 """open-gateway-ai — a learning re-implementation of what LiteLLM does, with httpx.
 
-Step 5: translate the OpenAI payload into Anthropic's Messages format.
+Step 6: map the retired "claude-3-5-sonnet" alias to a current model.
 
-This is the core of what LiteLLM does. The two schemas disagree on more than
-field names — the biggest one being how the system prompt is carried:
+The caller-facing model name stays constant; ANTHROPIC_MODEL_MAP rewrites it
+to the id actually sent upstream. LiteLLM keeps a model registry partly for
+this: aliases, renames, and provider-prefix stripping.
 
-    OpenAI    : a {"role": "system"} message inside messages[]
-    Anthropic : a top-level `system` field; "system" is not a valid role
-
-See translate_openai_to_anthropic() for the full list.
+The translation itself (step 5) is still the core lesson — see
+translate_openai_to_anthropic(); the system-prompt handling is why the
+Anthropic path needs real code rather than a passthrough.
 """
 
 from __future__ import annotations
@@ -35,7 +35,13 @@ ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 DEFAULT_MAX_TOKENS = 4096
 
 OPENAI_MODELS = {"gpt-4o-mini"}
-ANTHROPIC_MODELS = {"claude-3-5-sonnet"}
+
+# Incoming model name -> the id actually sent upstream. "claude-3-5-sonnet" is
+# the routing key callers use, but Claude 3.5 Sonnet was retired in Oct 2025,
+# so the real request targets a current model. Change the value, not the key.
+ANTHROPIC_MODEL_MAP = {
+    "claude-3-5-sonnet": "claude-sonnet-5",
+}
 
 
 @asynccontextmanager
@@ -142,7 +148,7 @@ def translate_openai_to_anthropic(req: ChatCompletionRequest) -> dict[str, Any]:
         )
 
     body: dict[str, Any] = {
-        "model": req.model,
+        "model": ANTHROPIC_MODEL_MAP.get(req.model, req.model),
         "messages": conversation,
         "max_tokens": req.max_tokens or DEFAULT_MAX_TOKENS,
     }
@@ -177,7 +183,7 @@ async def chat_completions(request: ChatCompletionRequest) -> Response:
         url = OPENAI_URL
         headers = {"authorization": f"Bearer {OPENAI_API_KEY}"}
         payload = request.model_dump(exclude_none=True)
-    elif request.model in ANTHROPIC_MODELS:
+    elif request.model in ANTHROPIC_MODEL_MAP:
         url = ANTHROPIC_URL
         headers = {
             "x-api-key": ANTHROPIC_API_KEY,
