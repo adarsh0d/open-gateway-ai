@@ -1,14 +1,12 @@
 """open-gateway-ai — a learning re-implementation of what LiteLLM does, with httpx.
 
-Step 7: handle missing keys and upstream transport failures.
+Step 8: pass streaming responses straight through.
 
-  missing provider key       -> 500 (clear message)
-  httpx transport error      -> 502
-  schema problem             -> 400, surfaced before the key check
-
-We still return the provider's raw error body + status untouched. LiteLLM
-instead maps provider errors onto typed openai.* exceptions with a consistent
-.status_code — convenient, but it hides the original response.
+When the caller sets "stream": true we proxy the upstream SSE byte stream
+instead of buffering. Both providers speak Server-Sent Events, but the frame
+formats differ (OpenAI: chat.completion.chunk objects; Anthropic: typed
+events). We only forward bytes — real normalisation would parse one stream
+and re-emit it in the other provider's shape. LiteLLM does that; we do not.
 """
 
 from __future__ import annotations
@@ -20,6 +18,7 @@ from typing import Any, Literal
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Response
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 load_dotenv()
@@ -198,6 +197,18 @@ async def chat_completions(request: ChatCompletionRequest) -> Response:
         raise HTTPException(status_code=400, detail=f"Unrecognised model: {request.model!r}")
 
     headers["content-type"] = "application/json"
+
+    if request.stream:
+        # Proxy the SSE byte stream as-is. Note: a StreamingResponse commits at
+        # HTTP 200 before the generator runs, so an upstream error status is
+        # not reflected on this path.
+        async def proxy_stream() -> Any:
+            async with client.stream("POST", url, json=payload, headers=headers) as r:
+                async for raw in r.aiter_raw():
+                    yield raw
+
+        return StreamingResponse(proxy_stream(), media_type="text/event-stream")
+
     try:
         upstream = await client.post(url, json=payload, headers=headers)
     except httpx.HTTPError as exc:
