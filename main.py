@@ -1,25 +1,43 @@
 """open-gateway-ai — a learning re-implementation of what LiteLLM does, with httpx.
 
-Step 2: accept and validate the OpenAI chat-completions request shape.
+Step 3: forward the request to OpenAI and return its raw response.
 
-The endpoint does nothing but parse the body and echo back what it parsed. The
-point is to see the *contract* — this is the exact JSON a caller sends to
-LiteLLM (and to OpenAI). Pydantic rejects anything malformed with a 422 before
-our handler runs.
+Single provider, hardcoded. This is the smallest thing that earns the name
+"gateway": inject the auth header, POST the JSON, proxy the reply back. For
+OpenAI there is no schema translation at all — our body already *is* the
+OpenAI schema. LiteLLM's OpenAI path is essentially this (plus retries and
+error mapping, added later).
 """
 
 from __future__ import annotations
 
+import os
+from contextlib import asynccontextmanager
 from typing import Any, Literal
 
-from fastapi import FastAPI
+import httpx
+from dotenv import load_dotenv
+from fastapi import FastAPI, Response
 from pydantic import BaseModel, ConfigDict, Field
 
-app = FastAPI(title="open-gateway-ai", version="0.2.0")
+load_dotenv()
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # One connection pool for the whole process, not one per request.
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        app.state.http = client
+        yield
+
+
+app = FastAPI(title="open-gateway-ai", version="0.3.0", lifespan=lifespan)
 
 
 class ChatMessage(BaseModel):
-    # extra="allow" keeps fields we don't model (tool_calls, tool_call_id, ...)
     model_config = ConfigDict(extra="allow")
 
     role: Literal["system", "developer", "user", "assistant", "tool"]
@@ -28,12 +46,6 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    """The subset of OpenAI's /v1/chat/completions body we validate explicitly.
-
-    `extra="allow"` lets any other OpenAI param (tools, seed, response_format,
-    ...) pass through untouched — the same permissiveness LiteLLM has.
-    """
-
     model_config = ConfigDict(extra="allow")
 
     model: str
@@ -54,7 +66,21 @@ async def health() -> dict[str, str]:
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest) -> dict[str, Any]:
-    # No provider call yet. Just prove the body validated and show what we got.
-    # exclude_none => only the fields the caller actually sent.
-    return {"parsed": request.model_dump(exclude_none=True)}
+async def chat_completions(request: ChatCompletionRequest) -> Response:
+    client: httpx.AsyncClient = app.state.http
+
+    # OpenAI accepts our body unchanged. The only work is auth.
+    headers = {
+        "authorization": f"Bearer {OPENAI_API_KEY}",
+        "content-type": "application/json",
+    }
+    payload = request.model_dump(exclude_none=True)
+
+    upstream = await client.post(OPENAI_URL, json=payload, headers=headers)
+
+    # Return OpenAI's response body + status code untouched.
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        media_type=upstream.headers.get("content-type", "application/json"),
+    )
