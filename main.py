@@ -1,12 +1,19 @@
 """open-gateway-ai — a learning re-implementation of what LiteLLM does, with httpx.
 
-Step 8: pass streaming responses straight through.
+One endpoint, POST /v1/chat/completions, that accepts the OpenAI chat body and:
 
-When the caller sets "stream": true we proxy the upstream SSE byte stream
-instead of buffering. Both providers speak Server-Sent Events, but the frame
-formats differ (OpenAI: chat.completion.chunk objects; Anthropic: typed
-events). We only forward bytes — real normalisation would parse one stream
-and re-emit it in the other provider's shape. LiteLLM does that; we do not.
+  * validates it with Pydantic (422 on malformed input)
+  * routes on `model`: gpt-4o-mini -> OpenAI, claude-3-5-sonnet -> Anthropic
+  * OpenAI path: forward unchanged (the body already is the OpenAI schema)
+  * Anthropic path: translate the body to the Messages format — the system
+    prompt moves to a top-level field, max_tokens is required, stop becomes
+    stop_sequences, etc. (see translate_openai_to_anthropic)
+  * returns the provider's raw JSON + status code (no response normalisation)
+
+Read the git history commit by commit — each one adds a single thing LiteLLM
+would otherwise do for you. What is deliberately NOT done: response
+translation, tool-call translation, streaming-frame translation, retries, a
+real model registry. See README.md.
 """
 
 from __future__ import annotations
