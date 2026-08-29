@@ -1,12 +1,15 @@
 """open-gateway-ai — a learning re-implementation of what LiteLLM does, with httpx.
 
-Step 3: forward the request to OpenAI and return its raw response.
+Step 4: route to a provider based on the `model` field.
 
-Single provider, hardcoded. This is the smallest thing that earns the name
-"gateway": inject the auth header, POST the JSON, proxy the reply back. For
-OpenAI there is no schema translation at all — our body already *is* the
-OpenAI schema. LiteLLM's OpenAI path is essentially this (plus retries and
-error mapping, added later).
+  gpt-4o-mini       -> OpenAI
+  claude-3-5-sonnet -> Anthropic
+  anything else      -> 400
+
+The Anthropic branch sets the correct auth headers and endpoint URL, but
+still forwards the OpenAI-shaped body UNCHANGED. That works for a single
+user message and 400s the moment there is a system message — Anthropic's
+request schema is different. The next commit adds the translation.
 """
 
 from __future__ import annotations
@@ -17,24 +20,30 @@ from typing import Any, Literal
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 load_dotenv()
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+ANTHROPIC_VERSION = os.environ.get("ANTHROPIC_VERSION", "2023-06-01")
+
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+
+OPENAI_MODELS = {"gpt-4o-mini"}
+ANTHROPIC_MODELS = {"claude-3-5-sonnet"}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # One connection pool for the whole process, not one per request.
     async with httpx.AsyncClient(timeout=60.0) as client:
         app.state.http = client
         yield
 
 
-app = FastAPI(title="open-gateway-ai", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="open-gateway-ai", version="0.4.0", lifespan=lifespan)
 
 
 class ChatMessage(BaseModel):
@@ -69,16 +78,26 @@ async def health() -> dict[str, str]:
 async def chat_completions(request: ChatCompletionRequest) -> Response:
     client: httpx.AsyncClient = app.state.http
 
-    # OpenAI accepts our body unchanged. The only work is auth.
-    headers = {
-        "authorization": f"Bearer {OPENAI_API_KEY}",
-        "content-type": "application/json",
-    }
-    payload = request.model_dump(exclude_none=True)
+    if request.model in OPENAI_MODELS:
+        url = OPENAI_URL
+        # OpenAI: Authorization: Bearer <key>
+        headers = {"authorization": f"Bearer {OPENAI_API_KEY}"}
+        payload = request.model_dump(exclude_none=True)
+    elif request.model in ANTHROPIC_MODELS:
+        url = ANTHROPIC_URL
+        # Anthropic: x-api-key + the REQUIRED anthropic-version header
+        headers = {
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": ANTHROPIC_VERSION,
+        }
+        # NAIVE: OpenAI body forwarded as-is. Broken for system messages.
+        payload = request.model_dump(exclude_none=True)
+    else:
+        raise HTTPException(status_code=400, detail=f"Unrecognised model: {request.model!r}")
 
-    upstream = await client.post(OPENAI_URL, json=payload, headers=headers)
+    headers["content-type"] = "application/json"
+    upstream = await client.post(url, json=payload, headers=headers)
 
-    # Return OpenAI's response body + status code untouched.
     return Response(
         content=upstream.content,
         status_code=upstream.status_code,
