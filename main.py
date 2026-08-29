@@ -1,14 +1,14 @@
 """open-gateway-ai — a learning re-implementation of what LiteLLM does, with httpx.
 
-Step 6: map the retired "claude-3-5-sonnet" alias to a current model.
+Step 7: handle missing keys and upstream transport failures.
 
-The caller-facing model name stays constant; ANTHROPIC_MODEL_MAP rewrites it
-to the id actually sent upstream. LiteLLM keeps a model registry partly for
-this: aliases, renames, and provider-prefix stripping.
+  missing provider key       -> 500 (clear message)
+  httpx transport error      -> 502
+  schema problem             -> 400, surfaced before the key check
 
-The translation itself (step 5) is still the core lesson — see
-translate_openai_to_anthropic(); the system-prompt handling is why the
-Anthropic path needs real code rather than a passthrough.
+We still return the provider's raw error body + status untouched. LiteLLM
+instead maps provider errors onto typed openai.* exceptions with a consistent
+.status_code — convenient, but it hides the original response.
 """
 
 from __future__ import annotations
@@ -181,20 +181,27 @@ async def chat_completions(request: ChatCompletionRequest) -> Response:
 
     if request.model in OPENAI_MODELS:
         url = OPENAI_URL
-        headers = {"authorization": f"Bearer {OPENAI_API_KEY}"}
         payload = request.model_dump(exclude_none=True)
+        if not OPENAI_API_KEY:
+            raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
+        headers = {"authorization": f"Bearer {OPENAI_API_KEY}"}
     elif request.model in ANTHROPIC_MODEL_MAP:
         url = ANTHROPIC_URL
+        payload = translate_openai_to_anthropic(request)  # 400s before the key check
+        if not ANTHROPIC_API_KEY:
+            raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not set")
         headers = {
             "x-api-key": ANTHROPIC_API_KEY,
             "anthropic-version": ANTHROPIC_VERSION,
         }
-        payload = translate_openai_to_anthropic(request)
     else:
         raise HTTPException(status_code=400, detail=f"Unrecognised model: {request.model!r}")
 
     headers["content-type"] = "application/json"
-    upstream = await client.post(url, json=payload, headers=headers)
+    try:
+        upstream = await client.post(url, json=payload, headers=headers)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc}")
 
     return Response(
         content=upstream.content,
